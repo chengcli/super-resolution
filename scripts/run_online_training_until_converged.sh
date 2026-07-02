@@ -13,6 +13,12 @@
 #   CONVERGENCE_MIN_IMPROVEMENT=0.0001
 #   CONVERGENCE_METRIC=live_after_coarse_consistency_speed
 #   PYTHON=python
+#
+# Example 1000-update data00 run:
+#   OUTPUT_ROOT=/data00/topora_online_w92_tiny_2gpu_1000 \
+#   MAX_UPDATES=1000 \
+#   CHUNK_UPDATES=100 \
+#   scripts/run_online_training_until_converged.sh configs/topora_online_data00_2gpu.yaml
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

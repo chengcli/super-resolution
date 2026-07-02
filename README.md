@@ -63,6 +63,30 @@ Outputs land in `runs/topora_online_w92_tiny/`:
 - `metrics/before_after.csv` — per-update live metrics plus the accept/reject
   decision. A healthy run shows `live_*_coarse_consistency_speed` decreasing.
 
+### Resumable `/data00` training
+
+For longer CUDA runs, use the chunked driver:
+
+```bash
+OUTPUT_ROOT=/data00/topora_online_w92_tiny_2gpu_1000 \
+MAX_UPDATES=1000 \
+CHUNK_UPDATES=100 \
+scripts/run_online_training_until_converged.sh configs/topora_online_data00_2gpu.yaml
+```
+
+The driver writes each chunk under `$OUTPUT_ROOT/chunk_NNNNNN/`, records the
+latest resumable checkpoint in `$OUTPUT_ROOT/latest_checkpoint.txt`, and
+appends chunk-level metrics to `$OUTPUT_ROOT/summary.csv`. Re-running the same
+command resumes from the latest checkpoint and continues until `MAX_UPDATES` or
+the convergence gate stops the run.
+
+The 1000-update validation run on July 2, 2026 wrote to
+`/data00/topora_online_w92_tiny_2gpu_1000`. It logged 1000 updates with 805
+accepted and 195 rejected guarded updates. The tracked loss proxy
+`live_after_coarse_consistency_speed` improved from 1.4164 on the first update
+to a best value of 0.01462 in chunk 9, then finished at 0.03260 after the final
+chunk. `nan_count`, `inf_count`, and `nonfinite_count` stayed at 0.
+
 ### Adapting to a real case
 
 Point `snapy.config` at your snapy YAML and adjust in
