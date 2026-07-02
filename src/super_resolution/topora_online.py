@@ -619,7 +619,14 @@ def _build_runner(config: dict[str, Any]) -> _LowResolutionSnapyRunner | _Proces
     case_path = snapy_cfg.get("config")
     if not case_path:
         raise ValueError("snapy.config must point to a snapy shallow-water YAML case file")
-    mode = str(snapy_cfg.get("mode", "two_process"))
+    # low_only is the default: run_snapy_online does not consume step.truth (see
+    # its "high_truth_available" comment), and the live sample's static terrain
+    # tile is synthetic/procedural (see static_tiles in run_snapy_online), not
+    # spatially registered to the snapy simulation domain — so a high-resolution
+    # truth mesh has nothing valid to supervise against yet. two_process still
+    # works and is exercised by tests, but until that alignment exists it only
+    # adds a second lockstep snapy process plus IPC overhead for no benefit.
+    mode = str(snapy_cfg.get("mode", "low_only"))
     if mode == "low_only":
         return _LowResolutionSnapyRunner(
             case_path,
@@ -680,7 +687,12 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
 
     num_updates = int(config.get("num_updates", 4))
     parallel_cfg = config.get("parallel", {})
-    live_repeat = int(parallel_cfg.get("live_repeat", max(1, len(cuda_ids))))
+    # Each snapy step produces exactly one live sample. Repeating it across
+    # device_ids does not add data-parallel work (every replica computes an
+    # identical forward/backward on the same tensor) so it defaults to 1 even
+    # when multiple cuda_ids are configured; only set live_repeat explicitly if
+    # a caller has a real reason to duplicate the update.
+    live_repeat = int(parallel_cfg.get("live_repeat", 1))
     accepted_count = 0
     rejected_count = 0
     update_idx = 0
@@ -718,6 +730,9 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
             "update": update_idx,
             "snapy_cycle": step.cycle,
             "snapy_time": step.time,
+            # step.truth is only populated under snapy.mode: two_process; it is
+            # not yet consumed as a training/metrics target (see _build_runner),
+            # so this stays a diagnostic flag rather than driving MAE/RMSE.
             "high_truth_available": int(getattr(step, "truth", None) is not None),
             "accepted": int(result["accepted"]),
             "accepted_updates": accepted_count,

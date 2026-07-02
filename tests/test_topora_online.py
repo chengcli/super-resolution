@@ -176,7 +176,7 @@ dynamics:
     assert [step.time for step in steps] == [0.5, 1.0]
 
 
-def test_build_runner_defaults_to_process_isolated_two_resolution():
+def test_build_runner_defaults_to_low_resolution_only():
     config = {
         "snapy": {
             "config": "configs/snapy_w92_tiny.yaml",
@@ -186,15 +186,14 @@ def test_build_runner_defaults_to_process_isolated_two_resolution():
 
     runner = topora_online._build_runner(config)
 
-    assert isinstance(runner, _ProcessIsolatedTwoResolutionSnapyRunner)
-    assert runner.low_device == "cpu"
-    assert runner.high_device == "cpu"
+    assert isinstance(runner, _LowResolutionSnapyRunner)
 
 
 def test_build_runner_uses_separate_snapy_worker_devices():
     config = {
         "snapy": {
             "config": "configs/snapy_w92_tiny.yaml",
+            "mode": "two_process",
             "low_device": "cuda:0",
             "high_device": "cuda:1",
         }

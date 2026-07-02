@@ -1,12 +1,16 @@
-# Online-train TopoRA beside a process-isolated two-resolution snapy W92 case.
-# Low/high snapy workers are pinned to separate CUDA devices; TopoRA uses
-# DataParallel across the same two devices.
+# Online-train TopoRA beside the tiny live snapy W92 shallow-water case using
+# two CUDA devices for the TopoRA sidecar. The snapy mesh runs low_only (see
+# _build_runner): the high-resolution truth from two_process mode isn't
+# consumed as a target yet (live samples use synthetic terrain, not real
+# geography aligned to the snapy domain), so it's not worth the extra process.
+# device_ids is left configured for when there's a real reason to split work
+# across GPUs; live_repeat is intentionally omitted (defaults to 1) since
+# duplicating the single live sample per step doesn't add data-parallel work.
 
 seed: 31
 device: cuda:0
 parallel:
   device_ids: [0, 1]
-  live_repeat: 2
 
 output_dir: /data00/topora_online_w92_tiny_2gpu
 init_from: weights/topora_distill_best.pt
@@ -17,9 +21,8 @@ coarse_dx: 1000
 
 snapy:
   config: configs/snapy_w92_tiny.yaml
-  mode: two_process
-  low_device: cuda:0
-  high_device: cuda:1
+  mode: low_only
+  device: cpu
   velocity_scale: 0.1
   coarse_cells: 9
 
