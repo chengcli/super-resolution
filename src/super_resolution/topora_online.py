@@ -142,6 +142,8 @@ def _teacher_samples(config: dict[str, Any], count: int) -> list[dict[str, torch
         static_channels=int(model_cfg.get("static_channels", 5)),
         dynamic_channels=int(model_cfg.get("dynamic_channels", 6)),
     )
+    source = "synthetic (weaker guard; supply FuXi cases for real anchoring)" if dataset.synthetic else str(root)
+    print(f"teacher replay source: {source}")
     return [dataset[idx] for idx in range(len(dataset))]
 
 

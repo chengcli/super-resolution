@@ -16,13 +16,14 @@ if missing:
     )
 EOF
 
-for path in $(python -c "
-import yaml
-cfg = yaml.safe_load(open('$CONFIG'))
-print(cfg.get('init_from') or '')
-print(cfg.get('data_root') or '')
-"); do
-  [ -e "$path" ] || { echo "missing: $path (see README: distilled checkpoint / teacher cases)" >&2; exit 1; }
-done
+INIT_FROM=$(python -c "import yaml; print(yaml.safe_load(open('$CONFIG')).get('init_from') or '')")
+DATA_ROOT=$(python -c "import yaml; print(yaml.safe_load(open('$CONFIG')).get('data_root') or '')")
+if [ -n "$INIT_FROM" ] && [ ! -e "$INIT_FROM" ]; then
+  echo "missing distilled weights: $INIT_FROM (see README)" >&2
+  exit 1
+fi
+if [ -n "$DATA_ROOT" ] && [ ! -e "$DATA_ROOT" ]; then
+  echo "note: $DATA_ROOT not found; teacher replay falls back to synthetic samples (see README)" >&2
+fi
 
 exec topora-online-run --config "$CONFIG"

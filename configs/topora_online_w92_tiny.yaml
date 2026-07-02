@@ -9,9 +9,12 @@
 # relative to this repo and reach into the sibling TopoRA checkout.
 
 seed: 31
+# FuXi teacher cases for the replay anchor (distributed privately). If the
+# directory is absent, replay falls back to synthetic samples: still runnable,
+# but a weaker guard on distilled skill.
 data_root: ../data/fuxi/dataset
 output_dir: runs/topora_online_w92_tiny
-init_from: ../runs/distill_fuxi_current/checkpoints/best.pt
+init_from: weights/topora_distill_best.pt
 num_updates: 5
 learning_rate: 0.0001
 replay_length: 2

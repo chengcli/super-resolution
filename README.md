@@ -30,23 +30,23 @@ tile seams are rejected and rolled back (model and optimizer state).
 ### Requirements
 
 1. This repo, plus `snapy` and `paddle` installed (see `pyproject.toml`).
-2. The **TopoRA artifact bundle** (`topora-online-bundle.tar.gz`, ~32 MB,
-   distributed privately — the TopoRA source is not on GitHub). It contains:
-   - `topo_ra-*.whl` — the TopoRA package;
-   - `runs/distill_fuxi_current/checkpoints/best.pt` — the distilled weights
-     online training starts from (do not re-distill first);
-   - `data/fuxi/dataset/case_*` — FuXi teacher replay cases that anchor the
-     guarded updates (the full distillation dataset is not needed).
-
-   Install the wheel into the same environment and extract `runs/` and
-   `data/` into the directory that contains this repo (the default config
-   resolves `../runs/...` and `../data/...`):
+2. The `topo-ra` **wheel** (~54 KB, distributed privately — the TopoRA source
+   is not on GitHub):
 
    ```bash
    pip install -e .                          # this repo
-   pip install topo_ra-*.whl --no-deps       # from the bundle
-   tar -xzf topora-online-bundle.tar.gz -C ..
+   pip install topo_ra-*.whl --no-deps      # deps already covered by snapy env
    ```
+
+3. The **distilled weights** ship with this repo:
+   `weights/topora_distill_best.pt` (~1 MB). Online training starts from them
+   (`init_from` in the config); do not re-distill first.
+4. Optional but recommended: a few FuXi teacher case folders (~20 MB each,
+   distributed privately) extracted to `../data/fuxi/dataset/case_XXXXXX/`
+   (`inputs.npz` + `outputs.npz`). They anchor the guarded updates with real
+   teacher truth. Without them, the replay anchor automatically falls back to
+   synthetic samples — the run works, but the guard on distilled skill is
+   weaker. The sidecar prints which replay source it is using.
 
 ### Run online training
 
