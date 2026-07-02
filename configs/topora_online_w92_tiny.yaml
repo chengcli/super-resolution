@@ -3,21 +3,18 @@
 # Run from the super-resolution directory:
 #   topora-online-run --config configs/topora_online_w92_tiny.yaml
 #
-# The snapy low-res wind is the live coarse forcing over FuXi terrain tiles;
-# updates are guarded by teacher replay (real FuXi cases). Live samples carry
-# no target, so acceptance uses the coarse-consistency gate. Paths below are
-# relative to this repo and reach into the sibling TopoRA checkout.
+# The snapy low-res wind is the live coarse forcing over procedurally
+# generated terrain tiles. Live samples carry no target, so acceptance uses
+# the coarse-consistency/seam/NaN/speed gate (no teacher data involved).
+# init_from starts the model from FuXi-distilled weights; from there, all
+# online adaptation is driven purely by the live snapy signal.
 
 seed: 31
-# FuXi teacher cases for the replay anchor (two ship with this repo). If the
-# directory is absent, replay falls back to synthetic samples: still runnable,
-# but a weaker guard on distilled skill.
-data_root: data/fuxi/dataset
 output_dir: runs/topora_online_w92_tiny
 init_from: weights/topora_distill_best.pt
 num_updates: 5
 learning_rate: 0.0001
-replay_length: 2
+static_tile_count: 2
 coarse_dx: 1000
 
 snapy:
@@ -32,7 +29,6 @@ training:
   gradient_steps_per_update: 2
 
 acceptance:
-  replay_tolerance: 0.25
   seam_tolerance: 0.25
   max_speed: 100.0
 
@@ -52,7 +48,6 @@ loss:
   alpha: 1.0
   beta: 0.01
   gamma: 0.01
-  weak_weight: 0.5
-  replay_supervised_weight: 1.0
+  weak_weight: 1.0
   lambda_coarse: 0.05
   lambda_speed: 0.5

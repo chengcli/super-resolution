@@ -9,8 +9,7 @@ import torch
 def seed_everything(seed: int = 0) -> int:
     """Seed Python ``random``, NumPy, and torch for reproducible runs.
 
-    The online sidecar samples its replay buffer with Python's ``random`` and
-    the synthetic data path uses NumPy, so seeding only ``torch`` left
+    The synthetic data path uses NumPy, so seeding only ``torch`` left
     accept/reject outcomes non-reproducible.
     Returns the resolved integer seed for convenience/logging.
     """

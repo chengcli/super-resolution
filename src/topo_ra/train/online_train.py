@@ -9,7 +9,6 @@ import torch
 
 from topo_ra.data.aloft_extension import extend_wind_from_top_level
 from topo_ra.data.fuxi_case_dataset import FuXiCaseDataset
-from topo_ra.data.replay_buffer import ReplayBuffer
 from topo_ra.data.synthetic_dataset import make_synthetic_sample
 from topo_ra.data.vertical_interp import FU_XI_AGL_LEVELS
 from topo_ra.eval.metrics import compute_metrics
@@ -43,9 +42,6 @@ LIVE_METRICS = [
     "nonfinite_count",
 ]
 
-REPLAY_METRICS = [*VERTICAL_METRICS, "MAE_u", "MAE_v", "MAE_w", "speed_RMSE", "radial_PSD_error"]
-
-
 def _sample_to_batch(sample: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     batch = {}
     for key, value in sample.items():
@@ -70,12 +66,9 @@ def _print_before_after(title: str, keys: list[str], before: dict[str, float], a
 def _candidate_accepted(
     before_live: dict[str, float],
     after_live: dict[str, float],
-    before_replay: dict[str, float],
-    after_replay: dict[str, float],
     cfg: dict[str, Any],
 ) -> bool:
     acceptance = cfg.get("acceptance", {})
-    replay_tol = float(acceptance.get("replay_tolerance", 0.25))
     seam_tol = float(acceptance.get("seam_tolerance", 0.25))
     seam_abs_tol = float(acceptance.get("seam_abs_tolerance", 0.0))
     max_speed = float(acceptance.get("max_speed", 100.0))
@@ -92,20 +85,15 @@ def _candidate_accepted(
             after_live["coarse_consistency_speed"]
             <= before_live["coarse_consistency_speed"] * (1.0 + 1e-3) + 1e-6
         )
-    before_replay_mae = before_replay["MAE_u"] + before_replay["MAE_v"] + before_replay["MAE_w"]
-    after_replay_mae = after_replay["MAE_u"] + after_replay["MAE_v"] + after_replay["MAE_w"]
-    replay_ok = after_replay_mae <= before_replay_mae * (1.0 + replay_tol) + 1e-6
     # Reject any update whose prediction contains NaN or Inf. nonfinite_count is
     # measured on the raw prediction (see compute_metrics), so this gate is live.
-    no_nonfinite = (
-        after_live["nonfinite_count"] == 0.0 and after_replay["nonfinite_count"] == 0.0
-    )
+    no_nonfinite = after_live["nonfinite_count"] == 0.0
     speed_ok = after_live["speed_p99"] < max_speed
     seam_ok = (
         after_live["tile_boundary_jump"]
         <= before_live["tile_boundary_jump"] * (1.0 + seam_tol) + seam_abs_tol + 1e-6
     )
-    return bool(live_ok and replay_ok and no_nonfinite and speed_ok and seam_ok)
+    return bool(live_ok and no_nonfinite and speed_ok and seam_ok)
 
 
 def _z_out_from_config(config: dict[str, Any]) -> torch.Tensor | None:
@@ -329,26 +317,22 @@ def guarded_online_update(
     model: TopoRA,
     optimizer: torch.optim.Optimizer,
     live: dict[str, torch.Tensor],
-    replay_batch: dict[str, torch.Tensor],
     config: dict[str, Any],
 ) -> dict[str, Any]:
     """Run one guarded online update on a live batch, rolling back on rejection.
 
-    Returns the acceptance decision plus before/after live and replay metrics.
+    Returns the acceptance decision plus before/after live metrics.
     """
     loss_cfg = config.get("loss", {})
     training_cfg = config.get("training", {})
     gradient_steps_per_update = max(1, int(training_cfg.get("gradient_steps_per_update", 1)))
     weak_weight = float(loss_cfg.get("weak_weight", 1.0))
     live_supervised_weight = float(loss_cfg.get("live_supervised_weight", 0.0))
-    replay_supervised_weight = float(loss_cfg.get("replay_supervised_weight", 1.0))
 
     model.eval()
     with torch.no_grad():
         before_live_pred, before_live_mask = _predict_for_batch(model, live)
-        before_replay_pred, before_replay_mask = _predict_for_batch(model, replay_batch)
         before_live = _metrics_for_prediction(before_live_pred, live, before_live_mask)
-        before_replay = _metrics_for_prediction(before_replay_pred, replay_batch, before_replay_mask)
 
     before_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
     # Snapshot optimizer state too, so a rejected update leaves no trace in the
@@ -377,27 +361,15 @@ def guarded_online_update(
                 live["dynamic_native"][:, :2],
                 loss_cfg,
             )
-
-        replay_pred, replay_mask = _predict_for_batch(model, replay_batch)
-        replay_pred_loss, replay_target_loss = _valid_vertical_view(replay_pred, replay_batch["target"], replay_mask)
-        assert replay_target_loss is not None
-        total_loss = total_loss + replay_supervised_weight * _supervised_online_loss(
-            replay_pred_loss,
-            replay_target_loss,
-            replay_batch["dynamic_native"][:, :2],
-            loss_cfg,
-        )
         total_loss.backward()
         optimizer.step()
 
     model.eval()
     with torch.no_grad():
         after_live_pred, after_live_mask = _predict_for_batch(model, live)
-        after_replay_pred, after_replay_mask = _predict_for_batch(model, replay_batch)
         after_live = _metrics_for_prediction(after_live_pred, live, after_live_mask)
-        after_replay = _metrics_for_prediction(after_replay_pred, replay_batch, after_replay_mask)
 
-    accepted = _candidate_accepted(before_live, after_live, before_replay, after_replay, config)
+    accepted = _candidate_accepted(before_live, after_live, config)
     if not accepted:
         model.load_state_dict(before_state)
         optimizer.load_state_dict(before_optimizer_state)
@@ -406,8 +378,6 @@ def guarded_online_update(
         "accepted": accepted,
         "before_live": before_live,
         "after_live": after_live,
-        "before_replay": before_replay,
-        "after_replay": after_replay,
     }
 
 
@@ -429,26 +399,19 @@ def run_online_training(config: dict[str, Any]) -> Path:
     z_out = _z_out_from_config(config)
     online_dx = int(config.get("coarse_dx", config.get("dx", 300)))
 
-    replay = ReplayBuffer(capacity=32)
-    for idx in range(int(config.get("replay_length", 2))):
-        replay.add(_make_online_sample(idx, dx=online_dx, config=config, z_out=z_out))
-
     accepted_count = 0
     rejected_count = 0
     num_updates = int(config.get("num_updates", 1))
 
     for update_idx in range(1, num_updates + 1):
         live = _sample_to_batch(_make_online_sample(100 + update_idx, dx=online_dx, config=config, z_out=z_out), device)
-        replay_batch = _sample_to_batch(replay.sample(1)[0], device)
-        result = guarded_online_update(model, optimizer, live, replay_batch, config)
+        result = guarded_online_update(model, optimizer, live, config)
         accepted = result["accepted"]
         before_live, after_live = result["before_live"], result["after_live"]
-        before_replay, after_replay = result["before_replay"], result["after_replay"]
         if accepted:
             accepted_count += 1
             checkpoint_path = checkpoint_dir / f"online_update_{update_idx:04d}.pt"
             torch.save({"model": model.state_dict(), "config": config, "update": update_idx}, checkpoint_path)
-            replay.add(_make_online_sample(100 + update_idx, dx=online_dx, config=config, z_out=z_out))
         else:
             rejected_count += 1
             checkpoint_path = checkpoint_dir / "rejected_no_checkpoint.pt"
@@ -456,8 +419,6 @@ def run_online_training(config: dict[str, Any]) -> Path:
         print(f"[online update {update_idx:04d} | n_tiles=1 | coarse_dx={online_dx}]")
         print()
         _print_before_after("LIVE SNAPY METRICS", LIVE_METRICS, before_live, after_live)
-        print()
-        _print_before_after("TEACHER REPLAY VALIDATION", REPLAY_METRICS, before_replay, after_replay)
         print()
         print(f"decision: {'ACCEPT' if accepted else 'REJECT'}")
         print(f"checkpoint: {checkpoint_path}")
@@ -471,9 +432,6 @@ def run_online_training(config: dict[str, Any]) -> Path:
         for key in LIVE_METRICS:
             row[f"live_before_{key}"] = before_live[key]
             row[f"live_after_{key}"] = after_live[key]
-        for key in REPLAY_METRICS:
-            row[f"replay_before_{key}"] = before_replay[key]
-            row[f"replay_after_{key}"] = after_replay[key]
         append_csv_row(metrics_dir / "before_after.csv", row)
 
     torch.save({"model": model.state_dict(), "config": config}, checkpoint_dir / "last.pt")

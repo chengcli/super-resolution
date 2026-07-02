@@ -2,8 +2,8 @@
 
 Each accepted snapy step yields the low-resolution coarse state; the sidecar
 converts it into a TopoRA live sample (snapy wind forcing over a local 30 m
-terrain tile) and applies one guarded online update. Teacher replay samples
-anchor every update so live adaptation cannot silently destroy distilled skill.
+terrain tile) and applies one guarded online update, gated on live-only
+coarse-consistency/seam/NaN/speed checks (see ``_candidate_accepted``).
 
 Uses the vendored ``topo_ra`` package that ships with this repo.
 """
@@ -17,12 +17,10 @@ from typing import Any
 import torch
 from torch.nn import functional as F
 
-from topo_ra.data.fuxi_case_dataset import FuXiCaseDataset
-from topo_ra.data.replay_buffer import ReplayBuffer
 from topo_ra.data.snapy_reader import HYDRO_W_ORDER
+from topo_ra.data.synthetic_dataset import make_synthetic_sample
 from topo_ra.train.online_train import (
     LIVE_METRICS,
-    REPLAY_METRICS,
     _print_before_after,
     _sample_to_batch,
     _set_trainable_parameters,
@@ -60,16 +58,6 @@ def _configured_cuda_ids(config: dict[str, Any], device: torch.device) -> list[i
     if missing:
         raise ValueError(f"Requested CUDA device ids {missing} but only {available} CUDA devices are visible")
     return ids
-
-
-def _batch_samples(samples: list[dict[str, torch.Tensor]], device: torch.device) -> dict[str, torch.Tensor]:
-    batch: dict[str, torch.Tensor] = {}
-    keys = set().union(*(sample.keys() for sample in samples))
-    for key in keys:
-        values = [sample.get(key) for sample in samples]
-        if all(isinstance(value, torch.Tensor) for value in values):
-            batch[key] = torch.stack([value for value in values if isinstance(value, torch.Tensor)]).to(device)
-    return batch
 
 
 def _repeat_batch(batch: dict[str, torch.Tensor], count: int) -> dict[str, torch.Tensor]:
@@ -131,7 +119,7 @@ def snapy_state_to_sample(
     The snapy coarse wind becomes the dynamic forcing (``dynamic_native`` and
     ``canonical_uv_100m``); the caller supplies the 30 m static terrain tile.
     The live sample carries no target: online updates use the weak
-    coarse-consistency loss plus teacher replay supervision.
+    coarse-consistency loss.
     """
     snapy_cfg = config.get("snapy", {})
     block_index = int(snapy_cfg.get("block_index", 0))
@@ -208,33 +196,6 @@ def _build_runner(config: dict[str, Any]) -> TwoResolutionRunner:
     )
 
 
-def _teacher_samples(config: dict[str, Any], count: int) -> list[dict[str, torch.Tensor]]:
-    model_cfg = config.get("model", {})
-    root = config.get("data_root")
-    synthetic = bool(config.get("synthetic", root is None))
-    try:
-        dataset = FuXiCaseDataset(
-            root=root,
-            synthetic=synthetic,
-            length=max(1, count),
-            static_channels=int(model_cfg.get("static_channels", 5)),
-            dynamic_channels=int(model_cfg.get("dynamic_channels", 6)),
-        )
-    except FileNotFoundError:
-        if "synthetic" in config:
-            raise
-        dataset = FuXiCaseDataset(
-            root=None,
-            synthetic=True,
-            length=max(1, count),
-            static_channels=int(model_cfg.get("static_channels", 5)),
-            dynamic_channels=int(model_cfg.get("dynamic_channels", 6)),
-        )
-    source = "synthetic (weaker guard; supply FuXi cases for real anchoring)" if dataset.synthetic else str(root)
-    print(f"teacher replay source: {source}")
-    return [dataset[idx] for idx in range(len(dataset))]
-
-
 def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
     seed_everything(config.get("seed", 0))
     if runner is None:
@@ -262,14 +223,20 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
         print(f"using CUDA DataParallel on devices: {cuda_ids}")
     z_out = _z_out_from_config(config)
 
-    teacher = _teacher_samples(config, int(config.get("replay_length", 2)))
-    replay = ReplayBuffer(capacity=32)
-    replay.extend(teacher)
-    static_tiles = [sample["static_30m"] for sample in teacher]
+    # Procedural terrain tiles cycled across updates; no FuXi case data needed.
+    model_cfg = config.get("model", {})
+    static_tile_count = max(1, int(config.get("static_tile_count", 2)))
+    static_tiles = [
+        make_synthetic_sample(
+            idx,
+            static_channels=int(model_cfg.get("static_channels", 5)),
+            dynamic_channels=int(model_cfg.get("dynamic_channels", 6)),
+        )["static_30m"]
+        for idx in range(static_tile_count)
+    ]
 
     num_updates = int(config.get("num_updates", 4))
     parallel_cfg = config.get("parallel", {})
-    replay_batch_size = int(parallel_cfg.get("replay_batch_size", max(1, len(cuda_ids))))
     live_repeat = int(parallel_cfg.get("live_repeat", max(1, len(cuda_ids))))
     accepted_count = 0
     rejected_count = 0
@@ -288,8 +255,7 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
             live_sample["z_out"] = z_out
         live = _sample_to_batch(live_sample, device)
         live = _repeat_batch(live, live_repeat)
-        replay_batch = _batch_samples(replay.sample(replay_batch_size), device)
-        result = guarded_online_update(model, optimizer, live, replay_batch, config)
+        result = guarded_online_update(model, optimizer, live, config)
         if result["accepted"]:
             accepted_count += 1
             checkpoint_path = checkpoint_dir / f"online_update_{update_idx:04d}.pt"
@@ -301,8 +267,6 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
         print(f"[snapy online update {update_idx:04d} | cycle={step.cycle} | t={step.time:.6g}]")
         print()
         _print_before_after("LIVE SNAPY METRICS", LIVE_METRICS, result["before_live"], result["after_live"])
-        print()
-        _print_before_after("TEACHER REPLAY VALIDATION", REPLAY_METRICS, result["before_replay"], result["after_replay"])
         print()
         print(f"decision: {'ACCEPT' if result['accepted'] else 'REJECT'}")
         print(f"checkpoint: {checkpoint_path}")
@@ -318,9 +282,6 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
         for key in LIVE_METRICS:
             row[f"live_before_{key}"] = result["before_live"][key]
             row[f"live_after_{key}"] = result["after_live"][key]
-        for key in REPLAY_METRICS:
-            row[f"replay_before_{key}"] = result["before_replay"][key]
-            row[f"replay_after_{key}"] = result["after_replay"][key]
         append_csv_row(metrics_dir / "before_after.csv", row)
 
     if update_idx == 0:

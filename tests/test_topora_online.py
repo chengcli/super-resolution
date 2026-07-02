@@ -75,12 +75,11 @@ class _FakeRunner:
 def test_run_snapy_online_executes_guarded_updates(tmp_path: Path):
     config = {
         "seed": 7,
-        "synthetic": True,
         "device": "cpu",
         "output_dir": str(tmp_path / "topora_online"),
         "num_updates": 2,
         "learning_rate": 1e-4,
-        "replay_length": 1,
+        "static_tile_count": 1,
         "coarse_dx": 1000,
         "model": {"static_channels": 5, "dynamic_channels": 6, "embed_dim": 8, "depth": 1, "latent_size": 9},
         "loss": {"alpha": 1.0, "beta": 0.01, "gamma": 0.01, "weak_weight": 0.5},

@@ -20,23 +20,21 @@ driver path. Predictions are never fed back into either model.
 ## TopoRA online-training sidecar
 
 `src/super_resolution/topora_online.py` trains the TopoRA wind downscaler
-beside a live snapy run. Each accepted snapy step becomes a live coarse-wind
-sample (interior u/v/w pooled to a 9x9 column over a 30 m terrain tile) and
-triggers one guarded online update: a weak coarse-consistency loss on the live
-sample plus a supervised loss on FuXi teacher replay samples. Updates that
-degrade replay skill, blow up speeds, produce non-finite values, or worsen
-tile seams are rejected and rolled back (model and optimizer state).
+beside a live snapy run. TopoRA starts from FuXi-distilled weights
+(`init_from`); from there, all online adaptation is driven purely by the live
+snapy signal, with no FuXi teacher data involved. Each accepted snapy step
+becomes a live coarse-wind sample (interior u/v/w pooled to a 9x9 column over
+a procedurally generated 30 m terrain tile) and triggers one guarded online
+update: a weak coarse-consistency loss on the live sample. Updates that blow
+up speeds, produce non-finite values, or worsen tile seams/coarse consistency
+are rejected and rolled back (model and optimizer state).
 
 Everything needed ships with this repo:
 
 - `src/topo_ra/` — vendored TopoRA package (model, online training, data
   utilities);
 - `weights/topora_distill_best.pt` (~1 MB) — distilled weights that online
-  training starts from (`init_from` in the config); do not re-distill first;
-- `data/fuxi/dataset/case_*` — two FuXi teacher cases that anchor the guarded
-  updates. If the directory is missing, the replay anchor falls back to
-  synthetic samples (runnable, but a weaker guard); the sidecar prints which
-  replay source it is using.
+  training starts from (`init_from` in the config); do not re-distill first.
 
 ### Run online training
 
@@ -62,18 +60,16 @@ Outputs land in `runs/topora_online_w92_tiny/`:
 
 - `checkpoints/online_update_NNNN.pt` — model after each accepted update
 - `checkpoints/last.pt` — final weights
-- `metrics/before_after.csv` — per-update live and replay metrics plus the
-  accept/reject decision. A healthy run shows
-  `live_*_coarse_consistency_speed` decreasing while
-  `replay_*_speed_RMSE` stays flat.
+- `metrics/before_after.csv` — per-update live metrics plus the accept/reject
+  decision. A healthy run shows `live_*_coarse_consistency_speed` decreasing.
 
 ### Adapting to a real case
 
 Point `snapy.config` at your snapy YAML and adjust in
 `configs/topora_online_w92_tiny.yaml`:
 
-- `init_from` / `data_root` — checkpoint and teacher-case paths (relative to
-  the working directory).
+- `init_from` — FuXi-distilled starting checkpoint (relative to the working
+  directory).
 - `snapy.velocity_scale` — bring the snapy wind magnitudes into the ~10 m/s
   regime TopoRA was trained on (0.1 suits the W92 case's contravariant
   velocities).
