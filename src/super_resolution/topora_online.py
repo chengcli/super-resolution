@@ -5,7 +5,7 @@ converts it into a TopoRA live sample (snapy wind forcing over a local 30 m
 terrain tile) and applies one guarded online update. Teacher replay samples
 anchor every update so live adaptation cannot silently destroy distilled skill.
 
-Requires the ``topo-ra`` package (install with ``pip install -e /path/to/TopoRA``).
+Uses the vendored ``topo_ra`` package that ships with this repo.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from torch.nn import functional as F
 from topo_ra.data.fuxi_case_dataset import FuXiCaseDataset
 from topo_ra.data.replay_buffer import ReplayBuffer
 from topo_ra.data.snapy_reader import HYDRO_W_ORDER
-from topo_ra.train.distill import _load_checkpoint, _load_model_state, _model_from_config
 from topo_ra.train.online_train import (
     LIVE_METRICS,
     REPLAY_METRICS,
@@ -30,6 +29,7 @@ from topo_ra.train.online_train import (
     _z_out_from_config,
     guarded_online_update,
 )
+from topo_ra.utils.checkpoint import load_checkpoint, load_model_state, model_from_config
 from topo_ra.utils.config import load_config
 from topo_ra.utils.device import resolve_device
 from topo_ra.utils.io import append_csv_row, ensure_dir
@@ -159,11 +159,11 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
     checkpoint_dir = ensure_dir(output_dir / "checkpoints")
     metrics_dir = ensure_dir(output_dir / "metrics")
 
-    model = _model_from_config(config).to(device)
+    model = model_from_config(config).to(device)
     init_from = config.get("init_from")
     if init_from:
-        checkpoint = _load_checkpoint(init_from, device)
-        _load_model_state(model, checkpoint["model"])
+        checkpoint = load_checkpoint(init_from, device)
+        load_model_state(model, checkpoint["model"])
     trainable_parameters = _set_trainable_parameters(model, config)
     if not trainable_parameters:
         raise ValueError("No trainable parameters selected for online training")

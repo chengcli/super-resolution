@@ -27,30 +27,24 @@ sample plus a supervised loss on FuXi teacher replay samples. Updates that
 degrade replay skill, blow up speeds, produce non-finite values, or worsen
 tile seams are rejected and rolled back (model and optimizer state).
 
-### Requirements
+Everything needed ships with this repo:
 
-1. This repo, plus `snapy` and `paddle` installed (see `pyproject.toml`).
-2. The `topo-ra` **wheel** (~54 KB, distributed privately — the TopoRA source
-   is not on GitHub):
-
-   ```bash
-   pip install -e .                          # this repo
-   pip install topo_ra-*.whl --no-deps      # deps already covered by snapy env
-   ```
-
-3. The **distilled weights** ship with this repo:
-   `weights/topora_distill_best.pt` (~1 MB). Online training starts from them
-   (`init_from` in the config); do not re-distill first.
-4. Optional but recommended: a few FuXi teacher case folders (~20 MB each,
-   distributed privately) extracted to `../data/fuxi/dataset/case_XXXXXX/`
-   (`inputs.npz` + `outputs.npz`). They anchor the guarded updates with real
-   teacher truth. Without them, the replay anchor automatically falls back to
-   synthetic samples — the run works, but the guard on distilled skill is
-   weaker. The sidecar prints which replay source it is using.
+- `src/topo_ra/` — vendored TopoRA package (model, online training, data
+  utilities);
+- `weights/topora_distill_best.pt` (~1 MB) — distilled weights that online
+  training starts from (`init_from` in the config); do not re-distill first;
+- `data/fuxi/dataset/case_*` — two FuXi teacher cases that anchor the guarded
+  updates. If the directory is missing, the replay anchor falls back to
+  synthetic samples (runnable, but a weaker guard); the sidecar prints which
+  replay source it is using.
 
 ### Run online training
 
-From this directory:
+```bash
+pip install -e .   # in an environment with snapy and paddle
+```
+
+Then, from this directory:
 
 ```bash
 topora-online-run --config configs/topora_online_w92_tiny.yaml

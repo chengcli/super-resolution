@@ -4,10 +4,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
 import torch
-
-pytest.importorskip("topo_ra")
 
 from super_resolution.topora_online import block_uvw, run_snapy_online, snapy_state_to_sample
 

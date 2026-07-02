@@ -28,5 +28,8 @@ dev = [
 super-resolution-run = "super_resolution.cli:main"
 topora-online-run = "super_resolution.topora_online:main"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/super_resolution", "src/topo_ra"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

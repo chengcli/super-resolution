@@ -12,7 +12,7 @@ missing = [m for m in ("snapy", "topo_ra", "super_resolution") if importlib.util
 if missing:
     sys.exit(
         f"missing packages: {', '.join(missing)}\n"
-        "install with: pip install -e . && pip install -e ../ --no-deps"
+        "install with: pip install -e . (in an environment with snapy/paddle)"
     )
 EOF
 
