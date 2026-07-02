@@ -16,3 +16,15 @@ super-resolution-run /path/to/w92.yaml --steps 10 --output-dir ./pairs
 
 The v1 runner targets Snapy's cubed-sphere shallow-water W92-style Python
 driver path. Predictions are never fed back into either model.
+
+## TopoRA online-training sidecar
+
+`topora_online.py` trains TopoRA beside a live snapy run: each accepted snapy
+step becomes a live coarse-wind sample and triggers one guarded online update
+(teacher-replay anchored, rollback on rejection). Uses CUDA when available,
+then Apple MPS, then CPU (`device:` in the config overrides).
+
+```bash
+pip install -e /path/to/TopoRA --no-deps  # topo-ra package
+topora-online-run --config configs/topora_online_w92_tiny.yaml
+```

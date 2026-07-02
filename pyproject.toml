@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 super-resolution-run = "super_resolution.cli:main"
+topora-online-run = "super_resolution.topora_online:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

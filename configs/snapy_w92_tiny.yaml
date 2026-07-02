@@ -1,0 +1,47 @@
+# Tiny single-process W92-style shallow-water snapy case for the online sidecar.
+# All six cubed-sphere faces live in one process (blocks_per_process: 6), so no
+# torchrun/dist setup is needed.
+
+geometry:
+  type: gnomonic-equiangle
+  bounds:
+    x1min: 0.0
+    x1max: 1.0
+    x2min_pi: -0.25
+    x2max_pi: 0.25
+    x3min_pi: -0.25
+    x3max_pi: 0.25
+  cells:
+    nx1: 1
+    nx2: 8
+    nx3: 8
+    nghost: 1
+
+distribute:
+  layout: cubed-sphere
+  backend: gloo
+  blocks_per_process: 6
+
+dynamics:
+  equation-of-state:
+    type: shallow-water
+  riemann-solver:
+    type: shallow-roe
+    dir: yz
+  reconstruct:
+    vertical:
+      type: dc
+    horizontal:
+      type: dc
+
+boundary-condition:
+  external:
+    x2-inner: periodic
+    x2-outer: periodic
+    x3-inner: periodic
+    x3-outer: periodic
+
+integration:
+  type: rk3
+  cfl: 0.9
+  nlim: 1000
