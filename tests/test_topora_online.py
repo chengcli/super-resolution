@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import csv
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 import torch
 
-from super_resolution.topora_online import block_uvw, run_snapy_online, snapy_state_to_sample
+import super_resolution.topora_online as topora_online
+from super_resolution.topora_online import (
+    _LowResolutionSnapyRunner,
+    _TopoRADataParallel,
+    block_uvw,
+    run_snapy_online,
+    snapy_state_to_sample,
+)
 
 
 def _fake_hydro_w(nx3: int = 8, nx2: int = 8, nx1: int = 1, nghost: int = 1) -> torch.Tensor:
@@ -93,3 +102,126 @@ def test_run_snapy_online_executes_guarded_updates(tmp_path: Path):
     assert rows[0]["snapy_cycle"] == "1"
     assert float(rows[0]["live_before_target_available"]) == 0.0
     assert (out / "checkpoints" / "last.pt").exists()
+
+
+def test_low_resolution_snapy_runner_only_builds_low_mesh(tmp_path: Path, monkeypatch):
+    config = tmp_path / "case.yaml"
+    config.write_text(
+        """
+geometry:
+  type: gnomonic-equiangle
+  cells: {nx1: 1, nx2: 4, nx3: 4, nghost: 1}
+distribute:
+  layout: cubed-sphere
+dynamics:
+  equation-of-state:
+    type: shallow-water
+""",
+        encoding="utf-8",
+    )
+    requested_resolutions = []
+
+    def _make_options(path, *, resolution, snapy_module):
+        requested_resolutions.append(resolution)
+        return {"resolution": resolution}
+
+    class _Intg:
+        stages = (0,)
+
+        def stop(self, cycle, time):
+            return False
+
+    class _Mesh:
+        def __init__(self, options):
+            assert options["resolution"] == "low"
+            self.finalized = False
+
+        def to(self, device):
+            self.device = device
+
+        def initialize(self, vars_):
+            return vars_, 0.0
+
+        def module(self, name):
+            assert name == "block0.intg"
+            return _Intg()
+
+        def set_cycle(self, cycle):
+            self.cycle = cycle
+
+        def max_time_step(self, vars_):
+            return 0.5
+
+        def forward(self, vars_, dt, stage):
+            vars_[0]["hydro_w"] = vars_[0]["hydro_w"] + 1.0
+
+        def check_redo(self, vars_):
+            return 0
+
+        def finalize(self, vars_, time):
+            self.finalized = True
+
+    monkeypatch.setattr(topora_online, "make_snapy_options", _make_options)
+    monkeypatch.setattr(topora_online, "initialize_w92", lambda mesh, cfg, device: [{"hydro_w": torch.zeros(1)}])
+    fake_snapy = ModuleType("snapy")
+    fake_snapy.Mesh = _Mesh
+    monkeypatch.setitem(sys.modules, "snapy", fake_snapy)
+
+    runner = _LowResolutionSnapyRunner(config, device="cpu")
+    steps = list(runner.run(max_steps=2))
+
+    assert requested_resolutions == ["low"]
+    assert [step.cycle for step in steps] == [1, 2]
+    assert [step.time for step in steps] == [0.5, 1.0]
+
+
+def test_dataparallel_predict_at_heights_uses_parallel_dispatch(monkeypatch):
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("output_heights", torch.tensor([5.0, 10.0, 20.0]))
+
+        def forward(self):
+            raise AssertionError("forward should be reached through the adapter")
+
+        def predict_at_heights(self, *args, **kwargs):
+            raise AssertionError("wrapper must not call the base module directly")
+
+    calls = []
+
+    def _fake_data_parallel(module, inputs, *, module_kwargs, device_ids, output_device, dim=0):
+        calls.append(
+            {
+                "module": module,
+                "inputs": inputs,
+                "module_kwargs": module_kwargs,
+                "device_ids": device_ids,
+                "output_device": output_device,
+                "dim": dim,
+            }
+        )
+        static_30m = inputs[0]
+        z_out_values = inputs[4]
+        return torch.zeros(static_30m.shape[0], 3, len(z_out_values), 2, 2)
+
+    monkeypatch.setattr(topora_online, "data_parallel", _fake_data_parallel)
+    model = _TopoRADataParallel(_Module())
+    model.device_ids = [0, 1]
+    model.output_device = 0
+
+    pred, valid_mask = model.predict_at_heights(
+        torch.zeros(2, 5, 4, 4),
+        torch.zeros(2, 6, 2, 2),
+        torch.zeros(2, 2, 2, 2),
+        torch.ones(2),
+        torch.tensor([5.0, 15.0]),
+        coarse_profile_heights=torch.tensor([0.0, 100.0]),
+    )
+
+    assert len(calls) == 1
+    assert isinstance(calls[0]["module"], topora_online._PredictAtHeightsAdapter)
+    assert calls[0]["inputs"][4] == (5.0, 15.0)
+    assert calls[0]["module_kwargs"]["coarse_profile_heights_values"] == (0.0, 100.0)
+    assert calls[0]["device_ids"] == [0, 1]
+    assert pred.shape == (2, 3, 2, 2, 2)
+    torch.testing.assert_close(valid_mask, torch.tensor([True, True]))

@@ -9,7 +9,7 @@ parallel:
 
 output_dir: /data00/topora_online_w92_tiny_2gpu
 init_from: weights/topora_distill_best.pt
-num_updates: 1
+num_updates: 5
 learning_rate: 0.0001
 static_tile_count: 2
 coarse_dx: 1000
@@ -17,8 +17,6 @@ coarse_dx: 1000
 snapy:
   config: configs/snapy_w92_tiny.yaml
   device: cpu
-  block_index: 1
-  sanitize_nonfinite: true
   velocity_scale: 0.1
   coarse_cells: 9
 

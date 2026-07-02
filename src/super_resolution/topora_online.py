@@ -11,12 +11,15 @@ Uses the vendored ``topo_ra`` package that ships with this repo.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn.parallel import data_parallel
 from torch.nn import functional as F
 
+from topo_ra.data.vertical_interp import heights_in_range
 from topo_ra.data.snapy_reader import HYDRO_W_ORDER
 from topo_ra.data.synthetic_dataset import make_synthetic_sample
 from topo_ra.train.online_train import (
@@ -33,14 +36,95 @@ from topo_ra.utils.device import resolve_device
 from topo_ra.utils.io import append_csv_row, ensure_dir
 from topo_ra.utils.seeding import seed_everything
 
-from .runner import TwoResolutionRunner
+from .config import (
+    config_nghost,
+    load_config as load_snapy_config,
+    make_snapy_options,
+    validate_shallow_water_config,
+)
+from .types import MeshState
+from .w92 import initialize_w92
+
+
+class _PredictAtHeightsAdapter(torch.nn.Module):
+    """Expose ``predict_at_heights`` as ``forward`` for DataParallel scatter."""
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(
+        self,
+        static_30m: torch.Tensor,
+        dynamic_native: torch.Tensor,
+        canonical_uv_100m: torch.Tensor,
+        coarse_dx: torch.Tensor,
+        z_out_values: tuple[float, ...],
+        *,
+        coarse_profile: torch.Tensor | None = None,
+        coarse_profile_heights_values: tuple[float, ...] | None = None,
+    ) -> torch.Tensor:
+        z_out = torch.tensor(z_out_values, device=static_30m.device, dtype=static_30m.dtype)
+        coarse_profile_heights = (
+            None
+            if coarse_profile_heights_values is None
+            else torch.tensor(coarse_profile_heights_values, device=static_30m.device, dtype=static_30m.dtype)
+        )
+        pred, _valid_mask = self.module.predict_at_heights(
+            static_30m,
+            dynamic_native,
+            canonical_uv_100m,
+            coarse_dx,
+            z_out,
+            coarse_profile=coarse_profile,
+            coarse_profile_heights=coarse_profile_heights,
+        )
+        return pred
 
 
 class _TopoRADataParallel(torch.nn.DataParallel):
     """DataParallel wrapper that preserves TopoRA's height-query API."""
 
     def predict_at_heights(self, *args: Any, **kwargs: Any) -> Any:
-        return self.module.predict_at_heights(*args, **kwargs)
+        if len(args) < 5:
+            raise TypeError("predict_at_heights requires static, dynamic, canonical, coarse_dx, and z_out")
+        static_30m, dynamic_native, canonical_uv_100m, coarse_dx, z_out, *rest = args
+        if rest:
+            raise TypeError("unexpected positional arguments after z_out")
+        if kwargs.get("return_diagnostics", False):
+            raise ValueError("DataParallel predict_at_heights does not support return_diagnostics=True")
+        z_out_tensor = torch.as_tensor(z_out, dtype=static_30m.dtype)
+        if z_out_tensor.ndim != 1:
+            raise ValueError("z_out must be a 1D tensor of AGL heights")
+        coarse_profile_heights = kwargs.pop("coarse_profile_heights", None)
+        coarse_profile_heights_values = None
+        if coarse_profile_heights is not None:
+            heights_tensor = torch.as_tensor(coarse_profile_heights, dtype=static_30m.dtype)
+            if heights_tensor.ndim != 1:
+                raise ValueError("coarse_profile_heights must be a 1D tensor")
+            coarse_profile_heights_values = tuple(float(value) for value in heights_tensor.detach().cpu())
+        adapter = _PredictAtHeightsAdapter(self.module)
+        pred = data_parallel(
+            adapter,
+            (
+                static_30m,
+                dynamic_native,
+                canonical_uv_100m,
+                coarse_dx,
+                tuple(float(value) for value in z_out_tensor.detach().cpu()),
+            ),
+            module_kwargs={
+                "coarse_profile": kwargs.pop("coarse_profile", None),
+                "coarse_profile_heights_values": coarse_profile_heights_values,
+            },
+            device_ids=self.device_ids,
+            output_device=getattr(self, "output_device", self.device_ids[0] if self.device_ids else None),
+        )
+        if kwargs:
+            raise TypeError(f"unexpected predict_at_heights keyword arguments: {sorted(kwargs)}")
+        source_heights = self.module.output_heights.to(device=pred.device, dtype=pred.dtype)
+        valid_mask = heights_in_range(z_out_tensor.to(device=pred.device, dtype=pred.dtype), source_heights)
+        return pred, valid_mask
 
 
 def _configured_cuda_ids(config: dict[str, Any], device: torch.device) -> list[int]:
@@ -78,6 +162,90 @@ def _repeat_batch(batch: dict[str, torch.Tensor], count: int) -> dict[str, torch
 def _model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     wrapped = model.module if isinstance(model, torch.nn.DataParallel) else model
     return wrapped.state_dict()
+
+
+@dataclass(frozen=True)
+class _LiveSnapyStep:
+    cycle: int
+    time: float
+    low: MeshState
+
+
+class _LowResolutionSnapyRunner:
+    """Run only the live low-resolution Snapy mesh used by online training."""
+
+    def __init__(
+        self,
+        config_path: str | Path,
+        *,
+        device: torch.device | str | None = None,
+        use_paddle_dist: bool = False,
+    ) -> None:
+        self.config_path = Path(config_path)
+        self.config = load_snapy_config(self.config_path)
+        validate_shallow_water_config(self.config)
+        self.nghost = config_nghost(self.config)
+        self.device = torch.device(device) if device is not None else None
+        self.use_paddle_dist = bool(use_paddle_dist)
+
+    def run(self, *, max_steps: int | None = None):
+        if max_steps is not None and max_steps < 0:
+            raise ValueError("max_steps must be non-negative")
+
+        import snapy
+
+        device = self._start_device()
+        mesh = None
+        vars_: MeshState | None = None
+        current_time = 0.0
+        try:
+            options = make_snapy_options(self.config_path, resolution="low", snapy_module=snapy)
+            mesh = snapy.Mesh(options)
+            mesh.to(device)
+            vars_, current_time = mesh.initialize(initialize_w92(mesh, self.config, device))
+            intg = mesh.module("block0.intg")
+
+            cycle = 0
+            accepted = 0
+            while max_steps is None or accepted < max_steps:
+                if intg.stop(cycle, current_time):
+                    break
+                cycle += 1
+                mesh.set_cycle(cycle)
+                dt = float(mesh.max_time_step(vars_))
+                for stage in range(len(intg.stages)):
+                    mesh.forward(vars_, dt, stage)
+
+                err = int(mesh.check_redo(vars_))
+                if err < 0:
+                    break
+                if err > 0:
+                    continue
+
+                current_time += dt
+                accepted += 1
+                yield _LiveSnapyStep(cycle=cycle, time=current_time, low=vars_)
+        finally:
+            if mesh is not None and vars_ is not None:
+                mesh.finalize(vars_, current_time)
+            self._close_dist()
+
+    def _start_device(self) -> torch.device:
+        if self.device is not None:
+            return self.device
+        if not self.use_paddle_dist:
+            return torch.device("cpu")
+        from paddle import start_dist
+
+        backend = self.config.get("distribute", {}).get("backend", "gloo")
+        return start_dist(backend)
+
+    def _close_dist(self) -> None:
+        if self.device is not None or not self.use_paddle_dist:
+            return
+        from paddle import close_dist
+
+        close_dist()
 
 
 def block_uvw(hydro_w: torch.Tensor, nghost: int) -> torch.Tensor:
@@ -180,7 +348,7 @@ def snapy_state_to_sample(
     return sample
 
 
-def _build_runner(config: dict[str, Any]) -> TwoResolutionRunner:
+def _build_runner(config: dict[str, Any]) -> _LowResolutionSnapyRunner:
     # Import snapy eagerly (instead of inside runner.run) so the float32
     # default-dtype reset in run_snapy_online happens after snapy's float64 switch.
     import snapy  # noqa: F401
@@ -189,7 +357,7 @@ def _build_runner(config: dict[str, Any]) -> TwoResolutionRunner:
     case_path = snapy_cfg.get("config")
     if not case_path:
         raise ValueError("snapy.config must point to a snapy shallow-water YAML case file")
-    return TwoResolutionRunner(
+    return _LowResolutionSnapyRunner(
         case_path,
         use_paddle_dist=bool(snapy_cfg.get("use_paddle_dist", False)),
         device=snapy_cfg.get("device", "cpu"),
