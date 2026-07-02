@@ -10,12 +10,14 @@ import torch
 
 import super_resolution.topora_online as topora_online
 from super_resolution.topora_online import (
+    _batch_samples,
     _LowResolutionSnapyRunner,
     _ProcessIsolatedTwoResolutionSnapyRunner,
     _TopoRADataParallel,
     block_uvw,
     run_snapy_online,
     snapy_state_to_sample,
+    snapy_state_to_samples,
 )
 
 
@@ -65,6 +67,71 @@ def test_snapy_state_to_sample_emits_profile_for_multilevel_state():
 
     assert sample["coarse_profile"].shape == (3, 3, 9, 9)
     assert torch.allclose(sample["coarse_profile_heights"], torch.tensor([100.0, 500.0, 1000.0]))
+
+
+def test_snapy_state_to_samples_builds_one_sample_per_block():
+    second_block = _fake_hydro_w().clone()
+    interior = (slice(None), slice(1, -1), slice(1, -1), slice(None))
+    second_block[2][interior[1:]] = 9.0  # u
+    second_block[3][interior[1:]] = -1.0  # v
+    state = [{"hydro_w": _fake_hydro_w()}, {"hydro_w": second_block}]
+    static_tiles = [torch.zeros(5, 300, 300), torch.ones(5, 300, 300)]
+    config = {"model": {"dynamic_channels": 6}, "snapy": {"velocity_scale": 1.0}, "coarse_dx": 1000}
+
+    samples = snapy_state_to_samples(state, nghost=1, static_tiles=static_tiles, config=config)
+
+    assert len(samples) == 2
+    assert torch.allclose(samples[0]["canonical_uv_100m"][0], torch.full((9, 9), 5.0))
+    assert torch.allclose(samples[1]["canonical_uv_100m"][0], torch.full((9, 9), 9.0))
+    assert torch.allclose(samples[0]["static_30m"], torch.zeros(5, 300, 300))
+    assert torch.allclose(samples[1]["static_30m"], torch.ones(5, 300, 300))
+
+
+def test_snapy_state_to_samples_skips_nonfinite_blocks_by_default():
+    bad = {"hydro_w": torch.full((4, 10, 10, 1), float("nan"), dtype=torch.float64)}
+    good = {"hydro_w": _fake_hydro_w()}
+    static_tiles = [torch.zeros(5, 300, 300)]
+    config = {"model": {"dynamic_channels": 6}, "snapy": {}, "coarse_dx": 1000}
+
+    samples = snapy_state_to_samples([bad, good], nghost=1, static_tiles=static_tiles, config=config)
+
+    assert len(samples) == 1
+
+
+def test_snapy_state_to_samples_raises_when_every_block_is_nonfinite():
+    bad = {"hydro_w": torch.full((4, 10, 10, 1), float("nan"), dtype=torch.float64)}
+    static_tiles = [torch.zeros(5, 300, 300)]
+    config = {"model": {"dynamic_channels": 6}, "snapy": {}, "coarse_dx": 1000}
+
+    try:
+        snapy_state_to_samples([bad], nghost=1, static_tiles=static_tiles, config=config)
+    except ValueError as exc:
+        assert "non-finite" in str(exc)
+    else:
+        raise AssertionError("expected an all-nonfinite block list to raise")
+
+
+def test_batch_samples_stacks_distinct_samples_and_shares_z_out():
+    samples = [
+        {
+            "static_30m": torch.zeros(5, 300, 300),
+            "dynamic_native": torch.zeros(6, 9, 9),
+            "z_out": torch.tensor([5.0, 10.0]),
+        },
+        {
+            "static_30m": torch.ones(5, 300, 300),
+            "dynamic_native": torch.ones(6, 9, 9),
+            "z_out": torch.tensor([5.0, 10.0]),
+        },
+    ]
+
+    batch = _batch_samples(samples, torch.device("cpu"))
+
+    assert batch["static_30m"].shape == (2, 5, 300, 300)
+    assert batch["dynamic_native"].shape == (2, 6, 9, 9)
+    assert torch.allclose(batch["static_30m"][0], torch.zeros(5, 300, 300))
+    assert torch.allclose(batch["static_30m"][1], torch.ones(5, 300, 300))
+    assert batch["z_out"].shape == (1, 2)  # shared vertical coordinate, not stacked per-sample
 
 
 @dataclass

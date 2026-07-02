@@ -14,7 +14,10 @@ output_dir: runs/topora_online_w92_tiny
 init_from: weights/topora_distill_best.pt
 num_updates: 5
 learning_rate: 0.0001
-static_tile_count: 2
+# snapy_w92_tiny.yaml has blocks_per_process: 6 (six cubed-sphere faces);
+# each step now trains on all six as a real batch (snapy_state_to_samples),
+# so 6 tiles means every block gets its own distinct terrain.
+static_tile_count: 6
 coarse_dx: 1000
 
 snapy:

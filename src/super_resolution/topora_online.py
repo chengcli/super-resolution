@@ -28,7 +28,6 @@ from topo_ra.data.synthetic_dataset import make_synthetic_sample
 from topo_ra.train.online_train import (
     LIVE_METRICS,
     _print_before_after,
-    _sample_to_batch,
     _set_trainable_parameters,
     _z_out_from_config,
     guarded_online_update,
@@ -147,19 +146,27 @@ def _configured_cuda_ids(config: dict[str, Any], device: torch.device) -> list[i
     return ids
 
 
-def _repeat_batch(batch: dict[str, torch.Tensor], count: int) -> dict[str, torch.Tensor]:
-    if count <= 1:
-        return batch
-    repeated: dict[str, torch.Tensor] = {}
+def _batch_samples(samples: list[dict[str, torch.Tensor]], device: torch.device) -> dict[str, torch.Tensor]:
+    """Stack distinct per-block samples into one real batch.
+
+    ``z_out``/``valid_mask``/``coarse_profile_heights`` are shared vertical
+    coordinates set identically on every sample (from config), not per-sample
+    data, so they're kept as a single ``[1, Z]``-shaped tensor rather than
+    stacked — matching what ``_batch_z_out``/``_batch_valid_mask``/
+    ``_batch_coarse_profile_heights`` in ``online_train.py`` expect.
+    """
     shared_vertical_keys = {"z_out", "valid_mask", "coarse_profile_heights"}
-    for key, value in batch.items():
+    keys = set().union(*(sample.keys() for sample in samples))
+    batch: dict[str, torch.Tensor] = {}
+    for key in keys:
+        values = [sample[key] for sample in samples if key in sample]
+        if len(values) != len(samples) or not all(isinstance(value, torch.Tensor) for value in values):
+            continue
         if key in shared_vertical_keys:
-            repeated[key] = value
-        elif value.shape[:1] == (1,):
-            repeated[key] = value.repeat((count, *([1] * (value.ndim - 1))))
+            batch[key] = values[0].unsqueeze(0).to(device)
         else:
-            repeated[key] = value
-    return repeated
+            batch[key] = torch.stack(values).to(device)
+    return batch
 
 
 def _model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -537,54 +544,30 @@ def block_uvw(hydro_w: torch.Tensor, nghost: int) -> torch.Tensor:
     return uvw.permute(0, 3, 1, 2).to(torch.float32)
 
 
-def snapy_state_to_sample(
-    low_state: list[dict[str, torch.Tensor]],
+def _extract_block_uvw(hydro_w: torch.Tensor, *, nghost: int, velocity_scale: float) -> tuple[torch.Tensor, int]:
+    """Pull raw u/v/w out of one block's ``hydro_w`` buffer.
+
+    Returns the ``[3, Zc, H, W]`` tensor (before coarse pooling) plus its
+    non-finite element count, so callers can decide whether to use, sanitize,
+    or skip the block.
+    """
+    block = hydro_w
+    if block.ndim == 5:
+        block = block[-1]
+    candidate = block_uvw(block.detach().cpu(), nghost) * velocity_scale
+    nonfinite_count = int((~torch.isfinite(candidate)).sum().item())
+    return candidate, nonfinite_count
+
+
+def _sample_from_block_uvw(
+    uvw: torch.Tensor,
     *,
-    nghost: int,
+    coarse_cells: int,
     static_30m: torch.Tensor,
     config: dict[str, Any],
+    snapy_cfg: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
-    """Build a TopoRA online live sample from a snapy low-resolution MeshState.
-
-    The snapy coarse wind becomes the dynamic forcing (``dynamic_native`` and
-    ``canonical_uv_100m``); the caller supplies the 30 m static terrain tile.
-    The live sample carries no target: online updates use the weak
-    coarse-consistency loss.
-    """
-    snapy_cfg = config.get("snapy", {})
-    block_index = int(snapy_cfg.get("block_index", 0))
-    velocity_scale = float(snapy_cfg.get("velocity_scale", 1.0))
-    coarse_cells = int(snapy_cfg.get("coarse_cells", 9))
-    candidate_indices = [block_index, *(idx for idx in range(len(low_state)) if idx != block_index)]
-    uvw = None
-    selected_block_index = block_index
-    nonfinite_counts: dict[int, int] = {}
-    candidates: dict[int, torch.Tensor] = {}
-    for idx in candidate_indices:
-        hydro_w = low_state[idx]["hydro_w"]
-        if hydro_w.ndim == 5:
-            hydro_w = hydro_w[-1]
-        candidate = block_uvw(hydro_w.detach().cpu(), nghost) * velocity_scale
-        nonfinite_count = int((~torch.isfinite(candidate)).sum().item())
-        candidates[idx] = candidate
-        if nonfinite_count == 0:
-            uvw = candidate
-            selected_block_index = idx
-            break
-        nonfinite_counts[idx] = nonfinite_count
-    if uvw is None:
-        if not bool(snapy_cfg.get("sanitize_nonfinite", False)):
-            raise ValueError(f"snapy low-resolution state contains non-finite u/v/w values: {nonfinite_counts}")
-        selected_block_index = min(nonfinite_counts, key=nonfinite_counts.get)
-        uvw = torch.nan_to_num(candidates[selected_block_index], nan=0.0, posinf=0.0, neginf=0.0)
-        print(
-            "snapy blocks were non-finite; "
-            f"sanitized block {selected_block_index} with {nonfinite_counts[selected_block_index]} bad values"
-        )
-    if selected_block_index != block_index:
-        print(f"snapy block {block_index} was non-finite; using finite block {selected_block_index}")
     coarse = F.adaptive_avg_pool2d(uvw, (coarse_cells, coarse_cells))
-
     reference_level = int(snapy_cfg.get("reference_level", -1))
     uv = coarse[:2, reference_level]
     dynamic_fields = [uv[0], uv[1], coarse[2, reference_level]]
@@ -608,6 +591,102 @@ def snapy_state_to_sample(
             heights_tensor = torch.arange(coarse.shape[1], dtype=torch.float32)
         sample["coarse_profile_heights"] = heights_tensor
     return sample
+
+
+def snapy_state_to_sample(
+    low_state: list[dict[str, torch.Tensor]],
+    *,
+    nghost: int,
+    static_30m: torch.Tensor,
+    config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Build a single TopoRA online live sample from one snapy block.
+
+    The snapy coarse wind becomes the dynamic forcing (``dynamic_native`` and
+    ``canonical_uv_100m``); the caller supplies the 30 m static terrain tile.
+    The live sample carries no target: online updates use the weak
+    coarse-consistency loss. Prefer ``snapy_state_to_samples`` for training,
+    which uses every usable block instead of just one.
+    """
+    snapy_cfg = config.get("snapy", {})
+    block_index = int(snapy_cfg.get("block_index", 0))
+    velocity_scale = float(snapy_cfg.get("velocity_scale", 1.0))
+    coarse_cells = int(snapy_cfg.get("coarse_cells", 9))
+    candidate_indices = [block_index, *(idx for idx in range(len(low_state)) if idx != block_index)]
+    uvw = None
+    selected_block_index = block_index
+    nonfinite_counts: dict[int, int] = {}
+    candidates: dict[int, torch.Tensor] = {}
+    for idx in candidate_indices:
+        candidate, nonfinite_count = _extract_block_uvw(
+            low_state[idx]["hydro_w"], nghost=nghost, velocity_scale=velocity_scale
+        )
+        candidates[idx] = candidate
+        if nonfinite_count == 0:
+            uvw = candidate
+            selected_block_index = idx
+            break
+        nonfinite_counts[idx] = nonfinite_count
+    if uvw is None:
+        if not bool(snapy_cfg.get("sanitize_nonfinite", False)):
+            raise ValueError(f"snapy low-resolution state contains non-finite u/v/w values: {nonfinite_counts}")
+        selected_block_index = min(nonfinite_counts, key=nonfinite_counts.get)
+        uvw = torch.nan_to_num(candidates[selected_block_index], nan=0.0, posinf=0.0, neginf=0.0)
+        print(
+            "snapy blocks were non-finite; "
+            f"sanitized block {selected_block_index} with {nonfinite_counts[selected_block_index]} bad values"
+        )
+    if selected_block_index != block_index:
+        print(f"snapy block {block_index} was non-finite; using finite block {selected_block_index}")
+    return _sample_from_block_uvw(
+        uvw, coarse_cells=coarse_cells, static_30m=static_30m, config=config, snapy_cfg=snapy_cfg
+    )
+
+
+def snapy_state_to_samples(
+    low_state: list[dict[str, torch.Tensor]],
+    *,
+    nghost: int,
+    static_tiles: list[torch.Tensor],
+    config: dict[str, Any],
+) -> list[dict[str, torch.Tensor]]:
+    """Build one TopoRA online live sample per usable cubed-sphere block.
+
+    Every snapy step already advances every block in ``low_state`` (e.g. the
+    six faces from ``blocks_per_process: 6`` in the W92 tiny case) — this uses
+    each finite block as its own sample, paired with a distinct static tile,
+    instead of discarding all but one (as ``snapy_state_to_sample`` does).
+    That gives ``guarded_online_update`` a real batch of genuinely different
+    data, so DataParallel across multiple GPUs has actual work to split
+    instead of redoing an identical forward/backward on a duplicated sample.
+    """
+    snapy_cfg = config.get("snapy", {})
+    velocity_scale = float(snapy_cfg.get("velocity_scale", 1.0))
+    coarse_cells = int(snapy_cfg.get("coarse_cells", 9))
+    sanitize_nonfinite = bool(snapy_cfg.get("sanitize_nonfinite", False))
+
+    samples: list[dict[str, torch.Tensor]] = []
+    skipped: dict[int, int] = {}
+    for idx, block in enumerate(low_state):
+        uvw, nonfinite_count = _extract_block_uvw(block["hydro_w"], nghost=nghost, velocity_scale=velocity_scale)
+        if nonfinite_count:
+            if not sanitize_nonfinite:
+                skipped[idx] = nonfinite_count
+                continue
+            uvw = torch.nan_to_num(uvw, nan=0.0, posinf=0.0, neginf=0.0)
+            print(f"snapy block {idx} was non-finite; sanitized {nonfinite_count} bad values")
+        static_30m = static_tiles[idx % len(static_tiles)]
+        samples.append(
+            _sample_from_block_uvw(
+                uvw, coarse_cells=coarse_cells, static_30m=static_30m, config=config, snapy_cfg=snapy_cfg
+            )
+        )
+
+    if not samples:
+        raise ValueError(f"snapy low-resolution state contains non-finite u/v/w values in every block: {skipped}")
+    if skipped:
+        print(f"snapy blocks skipped as non-finite (sanitize_nonfinite=False): {skipped}")
+    return samples
 
 
 def _build_runner(config: dict[str, Any]) -> _LowResolutionSnapyRunner | _ProcessIsolatedTwoResolutionSnapyRunner:
@@ -673,9 +752,12 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
         print(f"using CUDA DataParallel on devices: {cuda_ids}")
     z_out = _z_out_from_config(config)
 
-    # Procedural terrain tiles cycled across updates; no FuXi case data needed.
+    # Procedural terrain tiles, one per usable snapy block per step (see
+    # snapy_state_to_samples). Default to 6 so every block in a typical
+    # blocks_per_process: 6 case gets its own tile instead of reusing one; no
+    # FuXi case data needed.
     model_cfg = config.get("model", {})
-    static_tile_count = max(1, int(config.get("static_tile_count", 2)))
+    static_tile_count = max(1, int(config.get("static_tile_count", 6)))
     static_tiles = [
         make_synthetic_sample(
             idx,
@@ -686,30 +768,22 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
     ]
 
     num_updates = int(config.get("num_updates", 4))
-    parallel_cfg = config.get("parallel", {})
-    # Each snapy step produces exactly one live sample. Repeating it across
-    # device_ids does not add data-parallel work (every replica computes an
-    # identical forward/backward on the same tensor) so it defaults to 1 even
-    # when multiple cuda_ids are configured; only set live_repeat explicitly if
-    # a caller has a real reason to duplicate the update.
-    live_repeat = int(parallel_cfg.get("live_repeat", 1))
     accepted_count = 0
     rejected_count = 0
     update_idx = 0
     print(f"snapy online sidecar: device={device}, num_updates={num_updates}")
     for step in runner.run(max_steps=num_updates):
         update_idx += 1
-        static_30m = static_tiles[(update_idx - 1) % len(static_tiles)]
-        live_sample = snapy_state_to_sample(
+        live_samples = snapy_state_to_samples(
             step.low,
             nghost=runner.nghost,
-            static_30m=static_30m,
+            static_tiles=static_tiles,
             config=config,
         )
         if z_out is not None:
-            live_sample["z_out"] = z_out
-        live = _sample_to_batch(live_sample, device)
-        live = _repeat_batch(live, live_repeat)
+            for sample in live_samples:
+                sample["z_out"] = z_out
+        live = _batch_samples(live_samples, device)
         result = guarded_online_update(model, optimizer, live, config)
         if result["accepted"]:
             accepted_count += 1
