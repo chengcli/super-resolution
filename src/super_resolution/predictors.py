@@ -28,7 +28,10 @@ class BilinearUpscaler:
     def predict(
         self, low_state: MeshState, *, metadata: PredictionMetadata
     ) -> MeshState:
-        from paddle.restart_resize import resize_spatial_tensor
+        try:
+            from paddle.restart_resize import resize_spatial_tensor
+        except ModuleNotFoundError:
+            resize_spatial_tensor = _resize_spatial_tensor
 
         selected = set(self.variable_names)
         prediction: MeshState = []
@@ -47,3 +50,20 @@ class BilinearUpscaler:
 
 def _is_spatial_float_tensor(tensor: torch.Tensor) -> bool:
     return tensor.ndim >= 3 and tensor.is_floating_point()
+
+
+def _resize_spatial_tensor(
+    tensor: torch.Tensor, *, mode: str, nghost: int
+) -> torch.Tensor:
+    if mode != "refine":
+        raise ValueError(f"unsupported resize mode: {mode}")
+    del nghost
+    height, width = tensor.shape[-3:-1]
+    channels_first = tensor.movedim(-1, -3).reshape(-1, 1, height, width)
+    resized = torch.nn.functional.interpolate(
+        channels_first,
+        size=(height * 2, width * 2),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.reshape(*tensor.shape[:-3], tensor.shape[-1], height * 2, width * 2).movedim(-3, -1)

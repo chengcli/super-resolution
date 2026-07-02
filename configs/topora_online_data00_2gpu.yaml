@@ -1,0 +1,56 @@
+# Online-train TopoRA beside the tiny live snapy W92 shallow-water case using
+# two CUDA devices for the TopoRA sidecar. The snapy meshes remain on CPU.
+
+seed: 31
+device: cuda:0
+parallel:
+  device_ids: [0, 1]
+  replay_batch_size: 2
+  live_repeat: 2
+
+# FuXi teacher cases for the replay anchor. If /data00 does not contain FuXi
+# case folders, replay falls back to synthetic samples.
+data_root: /data00
+output_dir: /data00/topora_online_w92_tiny_2gpu
+init_from: weights/topora_distill_best.pt
+num_updates: 1
+learning_rate: 0.0001
+replay_length: 2
+coarse_dx: 1000
+
+snapy:
+  config: configs/snapy_w92_tiny.yaml
+  device: cpu
+  block_index: 1
+  sanitize_nonfinite: true
+  velocity_scale: 0.1
+  coarse_cells: 9
+
+training:
+  gradient_steps_per_update: 2
+
+acceptance:
+  replay_tolerance: 0.25
+  seam_tolerance: 0.25
+  max_speed: 100.0
+
+model:
+  static_channels: 5
+  dynamic_channels: 6
+  embed_dim: 24
+  depth: 3
+  latent_size: 30
+  refine_channels: 16
+  refine_depth: 3
+  z_channels: 16
+  z_depth: 2
+  z_basis_rank: 4
+
+loss:
+  alpha: 1.0
+  beta: 0.01
+  gamma: 0.01
+  weak_weight: 0.5
+  replay_supervised_weight: 1.0
+  lambda_coarse: 0.05
+  lambda_speed: 0.5

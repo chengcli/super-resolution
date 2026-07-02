@@ -38,6 +38,60 @@ from topo_ra.utils.seeding import seed_everything
 from .runner import TwoResolutionRunner
 
 
+class _TopoRADataParallel(torch.nn.DataParallel):
+    """DataParallel wrapper that preserves TopoRA's height-query API."""
+
+    def predict_at_heights(self, *args: Any, **kwargs: Any) -> Any:
+        return self.module.predict_at_heights(*args, **kwargs)
+
+
+def _configured_cuda_ids(config: dict[str, Any], device: torch.device) -> list[int]:
+    parallel_cfg = config.get("parallel", {})
+    requested = parallel_cfg.get("device_ids", config.get("device_ids"))
+    if requested is None:
+        return []
+    if device.type != "cuda":
+        raise ValueError("parallel.device_ids requires a CUDA training device")
+    ids = [int(item) for item in requested]
+    if len(ids) < 2:
+        return []
+    available = torch.cuda.device_count()
+    missing = [idx for idx in ids if idx < 0 or idx >= available]
+    if missing:
+        raise ValueError(f"Requested CUDA device ids {missing} but only {available} CUDA devices are visible")
+    return ids
+
+
+def _batch_samples(samples: list[dict[str, torch.Tensor]], device: torch.device) -> dict[str, torch.Tensor]:
+    batch: dict[str, torch.Tensor] = {}
+    keys = set().union(*(sample.keys() for sample in samples))
+    for key in keys:
+        values = [sample.get(key) for sample in samples]
+        if all(isinstance(value, torch.Tensor) for value in values):
+            batch[key] = torch.stack([value for value in values if isinstance(value, torch.Tensor)]).to(device)
+    return batch
+
+
+def _repeat_batch(batch: dict[str, torch.Tensor], count: int) -> dict[str, torch.Tensor]:
+    if count <= 1:
+        return batch
+    repeated: dict[str, torch.Tensor] = {}
+    shared_vertical_keys = {"z_out", "valid_mask", "coarse_profile_heights"}
+    for key, value in batch.items():
+        if key in shared_vertical_keys:
+            repeated[key] = value
+        elif value.shape[:1] == (1,):
+            repeated[key] = value.repeat((count, *([1] * (value.ndim - 1))))
+        else:
+            repeated[key] = value
+    return repeated
+
+
+def _model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    wrapped = model.module if isinstance(model, torch.nn.DataParallel) else model
+    return wrapped.state_dict()
+
+
 def block_uvw(hydro_w: torch.Tensor, nghost: int) -> torch.Tensor:
     """Extract the interior u/v/w columns from one snapy block ``hydro_w`` buffer.
 
@@ -83,12 +137,34 @@ def snapy_state_to_sample(
     block_index = int(snapy_cfg.get("block_index", 0))
     velocity_scale = float(snapy_cfg.get("velocity_scale", 1.0))
     coarse_cells = int(snapy_cfg.get("coarse_cells", 9))
-    hydro_w = low_state[block_index]["hydro_w"]
-    if hydro_w.ndim == 5:
-        hydro_w = hydro_w[-1]
-    uvw = block_uvw(hydro_w.detach().cpu(), nghost) * velocity_scale
-    if not torch.isfinite(uvw).all():
-        raise ValueError("snapy low-resolution state contains non-finite u/v/w values")
+    candidate_indices = [block_index, *(idx for idx in range(len(low_state)) if idx != block_index)]
+    uvw = None
+    selected_block_index = block_index
+    nonfinite_counts: dict[int, int] = {}
+    candidates: dict[int, torch.Tensor] = {}
+    for idx in candidate_indices:
+        hydro_w = low_state[idx]["hydro_w"]
+        if hydro_w.ndim == 5:
+            hydro_w = hydro_w[-1]
+        candidate = block_uvw(hydro_w.detach().cpu(), nghost) * velocity_scale
+        nonfinite_count = int((~torch.isfinite(candidate)).sum().item())
+        candidates[idx] = candidate
+        if nonfinite_count == 0:
+            uvw = candidate
+            selected_block_index = idx
+            break
+        nonfinite_counts[idx] = nonfinite_count
+    if uvw is None:
+        if not bool(snapy_cfg.get("sanitize_nonfinite", False)):
+            raise ValueError(f"snapy low-resolution state contains non-finite u/v/w values: {nonfinite_counts}")
+        selected_block_index = min(nonfinite_counts, key=nonfinite_counts.get)
+        uvw = torch.nan_to_num(candidates[selected_block_index], nan=0.0, posinf=0.0, neginf=0.0)
+        print(
+            "snapy blocks were non-finite; "
+            f"sanitized block {selected_block_index} with {nonfinite_counts[selected_block_index]} bad values"
+        )
+    if selected_block_index != block_index:
+        print(f"snapy block {block_index} was non-finite; using finite block {selected_block_index}")
     coarse = F.adaptive_avg_pool2d(uvw, (coarse_cells, coarse_cells))
 
     reference_level = int(snapy_cfg.get("reference_level", -1))
@@ -135,13 +211,25 @@ def _build_runner(config: dict[str, Any]) -> TwoResolutionRunner:
 def _teacher_samples(config: dict[str, Any], count: int) -> list[dict[str, torch.Tensor]]:
     model_cfg = config.get("model", {})
     root = config.get("data_root")
-    dataset = FuXiCaseDataset(
-        root=root,
-        synthetic=bool(config.get("synthetic", root is None)),
-        length=max(1, count),
-        static_channels=int(model_cfg.get("static_channels", 5)),
-        dynamic_channels=int(model_cfg.get("dynamic_channels", 6)),
-    )
+    synthetic = bool(config.get("synthetic", root is None))
+    try:
+        dataset = FuXiCaseDataset(
+            root=root,
+            synthetic=synthetic,
+            length=max(1, count),
+            static_channels=int(model_cfg.get("static_channels", 5)),
+            dynamic_channels=int(model_cfg.get("dynamic_channels", 6)),
+        )
+    except FileNotFoundError:
+        if "synthetic" in config:
+            raise
+        dataset = FuXiCaseDataset(
+            root=None,
+            synthetic=True,
+            length=max(1, count),
+            static_channels=int(model_cfg.get("static_channels", 5)),
+            dynamic_channels=int(model_cfg.get("dynamic_channels", 6)),
+        )
     source = "synthetic (weaker guard; supply FuXi cases for real anchoring)" if dataset.synthetic else str(root)
     print(f"teacher replay source: {source}")
     return [dataset[idx] for idx in range(len(dataset))]
@@ -168,6 +256,10 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
     if not trainable_parameters:
         raise ValueError("No trainable parameters selected for online training")
     optimizer = torch.optim.AdamW(trainable_parameters, lr=float(config.get("learning_rate", 2e-4)))
+    cuda_ids = _configured_cuda_ids(config, device)
+    if cuda_ids:
+        model = _TopoRADataParallel(model, device_ids=cuda_ids, output_device=cuda_ids[0])
+        print(f"using CUDA DataParallel on devices: {cuda_ids}")
     z_out = _z_out_from_config(config)
 
     teacher = _teacher_samples(config, int(config.get("replay_length", 2)))
@@ -176,6 +268,9 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
     static_tiles = [sample["static_30m"] for sample in teacher]
 
     num_updates = int(config.get("num_updates", 4))
+    parallel_cfg = config.get("parallel", {})
+    replay_batch_size = int(parallel_cfg.get("replay_batch_size", max(1, len(cuda_ids))))
+    live_repeat = int(parallel_cfg.get("live_repeat", max(1, len(cuda_ids))))
     accepted_count = 0
     rejected_count = 0
     update_idx = 0
@@ -192,12 +287,13 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
         if z_out is not None:
             live_sample["z_out"] = z_out
         live = _sample_to_batch(live_sample, device)
-        replay_batch = _sample_to_batch(replay.sample(1)[0], device)
+        live = _repeat_batch(live, live_repeat)
+        replay_batch = _batch_samples(replay.sample(replay_batch_size), device)
         result = guarded_online_update(model, optimizer, live, replay_batch, config)
         if result["accepted"]:
             accepted_count += 1
             checkpoint_path = checkpoint_dir / f"online_update_{update_idx:04d}.pt"
-            torch.save({"model": model.state_dict(), "config": config, "update": update_idx}, checkpoint_path)
+            torch.save({"model": _model_state_dict(model), "config": config, "update": update_idx}, checkpoint_path)
         else:
             rejected_count += 1
             checkpoint_path = checkpoint_dir / "rejected_no_checkpoint.pt"
@@ -229,7 +325,7 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
 
     if update_idx == 0:
         raise RuntimeError("snapy runner produced no accepted steps; nothing to train on")
-    torch.save({"model": model.state_dict(), "config": config}, checkpoint_dir / "last.pt")
+    torch.save({"model": _model_state_dict(model), "config": config}, checkpoint_dir / "last.pt")
     print(f"accepted {accepted_count} / rejected {rejected_count} updates")
     return output_dir
 
