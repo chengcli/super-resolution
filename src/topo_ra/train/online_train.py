@@ -79,11 +79,26 @@ def _candidate_accepted(
         if before_live.get("target_available", 0.0) != 1.0:
             raise ValueError("acceptance.target_metric requires live samples with target labels")
         target_tol = float(acceptance.get("target_tolerance", 0.0))
-        live_ok = after_live[target_metric] <= before_live[target_metric] * (1.0 + target_tol) + 1e-6
+        target_abs_tol = float(acceptance.get("target_abs_tolerance", 0.0))
+        live_ok = (
+            after_live[target_metric]
+            <= before_live[target_metric] * (1.0 + target_tol) + target_abs_tol + 1e-6
+        )
     else:
+        # A purely multiplicative tolerance collapses as the metric itself
+        # approaches zero (which is exactly what it's being optimized to do):
+        # once before_live is ~0.01-0.03, coarse_consistency_tolerance's slack
+        # shrinks below ordinary step-to-step optimizer noise, so nearly every
+        # update gets rejected even though nothing is actually wrong. The
+        # absolute floor keeps a fixed noise budget regardless of scale, the
+        # same way seam_abs_tolerance already does for the seam check below.
+        coarse_consistency_tol = float(acceptance.get("coarse_consistency_tolerance", 1e-3))
+        coarse_consistency_abs_tol = float(acceptance.get("coarse_consistency_abs_tolerance", 5e-3))
         live_ok = (
             after_live["coarse_consistency_speed"]
-            <= before_live["coarse_consistency_speed"] * (1.0 + 1e-3) + 1e-6
+            <= before_live["coarse_consistency_speed"] * (1.0 + coarse_consistency_tol)
+            + coarse_consistency_abs_tol
+            + 1e-6
         )
     # Reject any update whose prediction contains NaN or Inf. nonfinite_count is
     # measured on the raw prediction (see compute_metrics), so this gate is live.
