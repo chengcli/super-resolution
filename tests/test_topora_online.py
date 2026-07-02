@@ -11,6 +11,7 @@ import torch
 import super_resolution.topora_online as topora_online
 from super_resolution.topora_online import (
     _LowResolutionSnapyRunner,
+    _ProcessIsolatedTwoResolutionSnapyRunner,
     _TopoRADataParallel,
     block_uvw,
     run_snapy_online,
@@ -173,6 +174,49 @@ dynamics:
     assert requested_resolutions == ["low"]
     assert [step.cycle for step in steps] == [1, 2]
     assert [step.time for step in steps] == [0.5, 1.0]
+
+
+def test_build_runner_defaults_to_process_isolated_two_resolution():
+    config = {
+        "snapy": {
+            "config": "configs/snapy_w92_tiny.yaml",
+            "device": "cpu",
+        }
+    }
+
+    runner = topora_online._build_runner(config)
+
+    assert isinstance(runner, _ProcessIsolatedTwoResolutionSnapyRunner)
+    assert runner.low_device == "cpu"
+    assert runner.high_device == "cpu"
+
+
+def test_build_runner_uses_separate_snapy_worker_devices():
+    config = {
+        "snapy": {
+            "config": "configs/snapy_w92_tiny.yaml",
+            "low_device": "cuda:0",
+            "high_device": "cuda:1",
+        }
+    }
+
+    runner = topora_online._build_runner(config)
+
+    assert isinstance(runner, _ProcessIsolatedTwoResolutionSnapyRunner)
+    assert runner.low_device == "cuda:0"
+    assert runner.high_device == "cuda:1"
+
+
+def test_process_isolated_runner_rejects_diverged_times():
+    low_step = {"type": "advanced", "cycle": 3, "err": 0, "time": 1.0}
+    high_step = {"type": "advanced", "cycle": 3, "err": 0, "time": 1.1}
+
+    try:
+        _ProcessIsolatedTwoResolutionSnapyRunner._validate_step(low_step, high_step, 3)
+    except RuntimeError as exc:
+        assert "accepted times diverged" in str(exc)
+    else:
+        raise AssertionError("expected diverged worker times to fail validation")
 
 
 def test_dataparallel_predict_at_heights_uses_parallel_dispatch(monkeypatch):

@@ -1,5 +1,6 @@
-# Online-train TopoRA beside the tiny live snapy W92 shallow-water case using
-# two CUDA devices for the TopoRA sidecar. The snapy meshes remain on CPU.
+# Online-train TopoRA beside a process-isolated two-resolution snapy W92 case.
+# Low/high snapy workers are pinned to separate CUDA devices; TopoRA uses
+# DataParallel across the same two devices.
 
 seed: 31
 device: cuda:0
@@ -16,7 +17,9 @@ coarse_dx: 1000
 
 snapy:
   config: configs/snapy_w92_tiny.yaml
-  device: cpu
+  mode: two_process
+  low_device: cuda:0
+  high_device: cuda:1
   velocity_scale: 0.1
   coarse_cells: 9
 

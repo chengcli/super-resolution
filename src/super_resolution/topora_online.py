@@ -11,11 +11,14 @@ Uses the vendored ``topo_ra`` package that ships with this repo.
 from __future__ import annotations
 
 import argparse
+import queue
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.multiprocessing as mp
 from torch.nn.parallel import data_parallel
 from torch.nn import functional as F
 
@@ -169,6 +172,15 @@ class _LiveSnapyStep:
     cycle: int
     time: float
     low: MeshState
+    truth: MeshState | None = None
+
+
+def _state_to_wire(state: MeshState) -> list[dict[str, Any]]:
+    return [{name: tensor.detach().cpu().numpy().copy() for name, tensor in block.items()} for block in state]
+
+
+def _state_from_wire(state: list[dict[str, Any]]) -> MeshState:
+    return [{name: torch.from_numpy(value.copy()) for name, value in block.items()} for block in state]
 
 
 class _LowResolutionSnapyRunner:
@@ -246,6 +258,256 @@ class _LowResolutionSnapyRunner:
         from paddle import close_dist
 
         close_dist()
+
+
+def _snapy_resolution_worker(
+    *,
+    resolution: str,
+    config_path: str,
+    device_name: str | None,
+    use_paddle_dist: bool,
+    command_queue: Any,
+    result_queue: Any,
+) -> None:
+    mesh = None
+    vars_: MeshState | None = None
+    current_time = 0.0
+    dist_started = False
+    try:
+        import snapy
+
+        config = load_snapy_config(config_path)
+        validate_shallow_water_config(config)
+        device = torch.device(device_name) if device_name is not None else None
+        if device is None:
+            if use_paddle_dist:
+                from paddle import start_dist
+
+                backend = config.get("distribute", {}).get("backend", "gloo")
+                device = start_dist(backend)
+                dist_started = True
+            else:
+                device = torch.device("cpu")
+
+        options = make_snapy_options(config_path, resolution=resolution, snapy_module=snapy)
+        mesh = snapy.Mesh(options)
+        mesh.to(device)
+        vars_, current_time = mesh.initialize(initialize_w92(mesh, config, device))
+        intg = mesh.module("block0.intg")
+        result_queue.put(
+            {
+                "type": "ready",
+                "resolution": resolution,
+                "time": float(current_time),
+                "stages": len(intg.stages),
+                "nghost": config_nghost(config),
+            }
+        )
+
+        while True:
+            command = command_queue.get()
+            command_type = command.get("type")
+            if command_type == "shutdown":
+                break
+            if command_type == "max_dt":
+                cycle = int(command["cycle"])
+                stopped = bool(intg.stop(cycle, current_time))
+                dt = None if stopped else float(mesh.max_time_step(vars_))
+                result_queue.put({"type": "max_dt", "resolution": resolution, "stopped": stopped, "dt": dt})
+                continue
+            if command_type == "advance":
+                cycle = int(command["cycle"])
+                dt = float(command["dt"])
+                mesh.set_cycle(cycle)
+                for stage in range(len(intg.stages)):
+                    mesh.forward(vars_, dt, stage)
+                err = int(mesh.check_redo(vars_))
+                payload: dict[str, Any] = {
+                    "type": "advanced",
+                    "resolution": resolution,
+                    "cycle": cycle,
+                    "err": err,
+                    "time": float(current_time),
+                    "state": None,
+                }
+                if err == 0:
+                    current_time += dt
+                    payload["time"] = float(current_time)
+                    payload["state"] = _state_to_wire(vars_)
+                result_queue.put(payload)
+                continue
+            raise ValueError(f"Unknown worker command: {command_type!r}")
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "type": "error",
+                "resolution": resolution,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+    finally:
+        if mesh is not None and vars_ is not None:
+            try:
+                mesh.finalize(vars_, current_time)
+            except BaseException:
+                pass
+        if dist_started:
+            try:
+                from paddle import close_dist
+
+                close_dist()
+            except BaseException:
+                pass
+
+
+class _ProcessIsolatedTwoResolutionSnapyRunner:
+    """Run low and high Snapy meshes in separate worker processes."""
+
+    def __init__(
+        self,
+        config_path: str | Path,
+        *,
+        low_device: str | None = None,
+        high_device: str | None = None,
+        use_paddle_dist: bool = False,
+        start_method: str = "spawn",
+        queue_timeout_s: float = 120.0,
+    ) -> None:
+        self.config_path = Path(config_path)
+        self.config = load_snapy_config(self.config_path)
+        validate_shallow_water_config(self.config)
+        self.nghost = config_nghost(self.config)
+        self.low_device = low_device
+        self.high_device = high_device
+        self.use_paddle_dist = bool(use_paddle_dist)
+        self.start_method = start_method
+        self.queue_timeout_s = float(queue_timeout_s)
+
+    def run(self, *, max_steps: int | None = None):
+        if max_steps is not None and max_steps < 0:
+            raise ValueError("max_steps must be non-negative")
+
+        ctx = mp.get_context(self.start_method)
+        low_commands = ctx.Queue()
+        high_commands = ctx.Queue()
+        low_results = ctx.Queue()
+        high_results = ctx.Queue()
+        low_process = ctx.Process(
+            target=_snapy_resolution_worker,
+            kwargs={
+                "resolution": "low",
+                "config_path": str(self.config_path),
+                "device_name": self.low_device,
+                "use_paddle_dist": self.use_paddle_dist,
+                "command_queue": low_commands,
+                "result_queue": low_results,
+            },
+        )
+        high_process = ctx.Process(
+            target=_snapy_resolution_worker,
+            kwargs={
+                "resolution": "high",
+                "config_path": str(self.config_path),
+                "device_name": self.high_device,
+                "use_paddle_dist": self.use_paddle_dist,
+                "command_queue": high_commands,
+                "result_queue": high_results,
+            },
+        )
+        processes = (low_process, high_process)
+        command_queues = (low_commands, high_commands)
+        try:
+            low_process.start()
+            high_process.start()
+            low_ready = self._get_result(low_results, "low")
+            high_ready = self._get_result(high_results, "high")
+            self._raise_if_error(low_ready)
+            self._raise_if_error(high_ready)
+            if low_ready["type"] != "ready" or high_ready["type"] != "ready":
+                raise RuntimeError(f"Unexpected worker startup payloads: {low_ready}, {high_ready}")
+            self._validate_ready(low_ready, high_ready)
+
+            cycle = 0
+            accepted = 0
+            while max_steps is None or accepted < max_steps:
+                low_commands.put({"type": "max_dt", "cycle": cycle})
+                high_commands.put({"type": "max_dt", "cycle": cycle})
+                low_dt = self._get_result(low_results, "low")
+                high_dt = self._get_result(high_results, "high")
+                self._raise_if_error(low_dt)
+                self._raise_if_error(high_dt)
+                if bool(low_dt["stopped"]) or bool(high_dt["stopped"]):
+                    break
+
+                cycle += 1
+                dt = min(float(low_dt["dt"]), float(high_dt["dt"]))
+                low_commands.put({"type": "advance", "cycle": cycle, "dt": dt})
+                high_commands.put({"type": "advance", "cycle": cycle, "dt": dt})
+                low_step = self._get_result(low_results, "low")
+                high_step = self._get_result(high_results, "high")
+                self._raise_if_error(low_step)
+                self._raise_if_error(high_step)
+                self._validate_step(low_step, high_step, cycle)
+
+                low_err = int(low_step["err"])
+                high_err = int(high_step["err"])
+                if low_err < 0 or high_err < 0:
+                    break
+                if low_err > 0 or high_err > 0:
+                    continue
+
+                accepted += 1
+                yield _LiveSnapyStep(
+                    cycle=cycle,
+                    time=float(low_step["time"]),
+                    low=_state_from_wire(low_step["state"]),
+                    truth=_state_from_wire(high_step["state"]),
+                )
+        finally:
+            for command_queue in command_queues:
+                try:
+                    command_queue.put({"type": "shutdown"})
+                except BaseException:
+                    pass
+            for process in processes:
+                process.join(timeout=5.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5.0)
+
+    def _get_result(self, result_queue: Any, resolution: str) -> dict[str, Any]:
+        try:
+            result = result_queue.get(timeout=self.queue_timeout_s)
+        except queue.Empty as exc:
+            raise TimeoutError(f"Timed out waiting for {resolution} Snapy worker") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Unexpected {resolution} worker payload: {result!r}")
+        return result
+
+    @staticmethod
+    def _raise_if_error(result: dict[str, Any]) -> None:
+        if result.get("type") == "error":
+            raise RuntimeError(f"{result.get('resolution')} Snapy worker failed: {result.get('error')}\n{result.get('traceback')}")
+
+    @staticmethod
+    def _validate_ready(low_ready: dict[str, Any], high_ready: dict[str, Any]) -> None:
+        if abs(float(low_ready["time"]) - float(high_ready["time"])) > 1.0e-12:
+            raise RuntimeError(f"Low/high workers initialized at different times: {low_ready['time']} != {high_ready['time']}")
+        if int(low_ready["stages"]) != int(high_ready["stages"]):
+            raise RuntimeError(f"Low/high workers have different integrator stage counts: {low_ready['stages']} != {high_ready['stages']}")
+        if int(low_ready["nghost"]) != int(high_ready["nghost"]):
+            raise RuntimeError(f"Low/high workers have different ghost-cell counts: {low_ready['nghost']} != {high_ready['nghost']}")
+
+    @staticmethod
+    def _validate_step(low_step: dict[str, Any], high_step: dict[str, Any], cycle: int) -> None:
+        if low_step["type"] != "advanced" or high_step["type"] != "advanced":
+            raise RuntimeError(f"Unexpected worker step payloads: {low_step}, {high_step}")
+        if int(low_step["cycle"]) != cycle or int(high_step["cycle"]) != cycle:
+            raise RuntimeError(f"Low/high worker cycle mismatch at coordinator cycle {cycle}: {low_step['cycle']} / {high_step['cycle']}")
+        if int(low_step["err"]) == 0 and int(high_step["err"]) == 0:
+            if abs(float(low_step["time"]) - float(high_step["time"])) > 1.0e-10:
+                raise RuntimeError(f"Low/high accepted times diverged: {low_step['time']} != {high_step['time']}")
 
 
 def block_uvw(hydro_w: torch.Tensor, nghost: int) -> torch.Tensor:
@@ -348,7 +610,7 @@ def snapy_state_to_sample(
     return sample
 
 
-def _build_runner(config: dict[str, Any]) -> _LowResolutionSnapyRunner:
+def _build_runner(config: dict[str, Any]) -> _LowResolutionSnapyRunner | _ProcessIsolatedTwoResolutionSnapyRunner:
     # Import snapy eagerly (instead of inside runner.run) so the float32
     # default-dtype reset in run_snapy_online happens after snapy's float64 switch.
     import snapy  # noqa: F401
@@ -357,10 +619,23 @@ def _build_runner(config: dict[str, Any]) -> _LowResolutionSnapyRunner:
     case_path = snapy_cfg.get("config")
     if not case_path:
         raise ValueError("snapy.config must point to a snapy shallow-water YAML case file")
-    return _LowResolutionSnapyRunner(
+    mode = str(snapy_cfg.get("mode", "two_process"))
+    if mode == "low_only":
+        return _LowResolutionSnapyRunner(
+            case_path,
+            use_paddle_dist=bool(snapy_cfg.get("use_paddle_dist", False)),
+            device=snapy_cfg.get("device", "cpu"),
+        )
+    if mode != "two_process":
+        raise ValueError("snapy.mode must be 'two_process' or 'low_only'")
+    default_device = snapy_cfg.get("device", "cpu")
+    return _ProcessIsolatedTwoResolutionSnapyRunner(
         case_path,
         use_paddle_dist=bool(snapy_cfg.get("use_paddle_dist", False)),
-        device=snapy_cfg.get("device", "cpu"),
+        low_device=snapy_cfg.get("low_device", default_device),
+        high_device=snapy_cfg.get("high_device", default_device),
+        start_method=str(snapy_cfg.get("start_method", "spawn")),
+        queue_timeout_s=float(snapy_cfg.get("queue_timeout_s", 120.0)),
     )
 
 
@@ -443,6 +718,7 @@ def run_snapy_online(config: dict[str, Any], runner: Any | None = None) -> Path:
             "update": update_idx,
             "snapy_cycle": step.cycle,
             "snapy_time": step.time,
+            "high_truth_available": int(getattr(step, "truth", None) is not None),
             "accepted": int(result["accepted"]),
             "accepted_updates": accepted_count,
             "rejected_updates": rejected_count,
